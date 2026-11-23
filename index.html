@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>かえるジャンパー（仮題）— 試作 r53</title>
+<title>かえるジャンパー（仮題）— 試作 r54</title>
 <style>
 html,body{margin:0;height:100%;overflow:hidden;background:#1d3b30;font-family:"Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic UI","Meiryo",system-ui,sans-serif;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
 #game{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
@@ -382,11 +382,16 @@ const KaeruCore = (() => {
   //   段順は moriao(100) → yadoku(300) → ushi(600) → cobalt(1000) → akame(1500) → kiobi(2200)。
   //   （r53／2026-11-23 本人決定で段5・段6を入れ替え。FROGS の配列順＝選択画面の表示順もこの段順に一致）
   //   解放は蓄積型（一度解放された系統は条件を組み替えても剥奪しない）
+  // r54（2026-11-23 本人決定）：解放は1回の評価（＝1プレイの結果確定）につき最大1種だけ。
+  //   条件を満たした未解放種が複数あっても、ラダー順（VARIANTS の並び＝FROGS の段順）で最初の1種だけを解放し、
+  //   残りは次の評価に回す。すでに記録が貯まっている人も、同じく1プレイに1種ずつ順に解放される。
   const evaluateUnlocks = (best, total, unlocked = []) => {
-    const ok = VARIANTS.filter(v => (Number.isFinite(v.unlock.best) && best >= v.unlock.best) || total >= v.unlock.total).map(v => v.id);
+    const next = VARIANTS.find(v => !unlocked.includes(v.id)
+      && ((Number.isFinite(v.unlock.best) && best >= v.unlock.best) || total >= v.unlock.total));
+    const newly = next ? [next.id] : [];
     return {
-      unlocked: FROG_IDS.filter(id => unlocked.includes(id) || ok.includes(id)),
-      newly: ok.filter(id => !unlocked.includes(id)),
+      unlocked: FROG_IDS.filter(id => unlocked.includes(id) || newly.includes(id)),
+      newly,
     };
   };
   const nextMilestone = m => {
@@ -1997,10 +2002,11 @@ const KaeruCore = (() => {
       }
       s.unlocked = FROG_IDS.filter(id => s.unlocked.includes(id));
     }
-    // r41：旧条件の保存でも、すでに新しい累計条件に達していれば選択できる。
-    if (s.total >= frogById('cobalt').unlock.total && !s.unlocked.includes('cobalt')) {
-      s.unlocked = FROG_IDS.filter(id => id === 'cobalt' || s.unlocked.includes(id));
-    }
+    // r54：r41 の読み込み時コバルト特例（累計が新条件に達していれば読み込み時点でコバルトを解放）は廃止した。
+    //   r54 から解放は「1プレイに1種・ラダー順」に統一したため、読み込み時点で順番を飛ばしてコバルトだけを
+    //   先に解放する経路は新仕様と衝突する。累計が届いている人は、結果確定ごとの evaluateUnlocks で段順に
+    //   解放されていき、コバルトも自分の順番が来れば解放される。すでに特例で解放済みのコバルトは
+    //   s.unlocked に保存済みなので、この廃止で剥奪は起きない。
     const bf = json(SAVE_KEYS.byFrog), bfOk = isObj(bf);
     for (const id of FAMILY_IDS) s.bestByFamily[id] = bfOk && typeof bf[id] === 'number' ? nonNeg(bf[id]) : 0;
     if (bfOk) for (const k of Object.keys(bf)) if (!FAMILY_IDS.includes(k)) s.keep.bestByFrog[k] = bf[k];
@@ -4319,7 +4325,7 @@ const GRANK_CONFIG = {
   storageBucket: 'kaeru-jumper.firebasestorage.app',
 };
 // clientId・保留キューは save.stats.grank に置く（stats は未知項目を保持する。新しい localStorage キーは作らない）
-KaeruRank.init({ enabled: GRANK_ENABLED, config: GRANK_CONFIG, version: 'r53', store: {
+KaeruRank.init({ enabled: GRANK_ENABLED, config: GRANK_CONFIG, version: 'r54', store: {
   read: () => (save.stats.grank && typeof save.stats.grank === 'object' && !Array.isArray(save.stats.grank) ? save.stats.grank : null),
   write: obj => { save.stats.grank = obj; writeSave(); },
 } });
