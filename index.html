@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>かえるジャンパー（仮題）— 試作 r54</title>
+<title>かえるジャンパー（仮題）— 試作 r56</title>
 <style>
 html,body{margin:0;height:100%;overflow:hidden;background:#1d3b30;font-family:"Hiragino Maru Gothic ProN","Hiragino Sans","Yu Gothic UI","Meiryo",system-ui,sans-serif;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
 #game{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
@@ -92,6 +92,12 @@ h2{margin:6px 0 10px;font-size:22px}
 #rNext .pnote{font-weight:700}
 .zabun.yay{color:#e8590c}
 #hDist .skips{font-size:15px;margin-left:8px;vertical-align:middle}
+/* r56：救済の残数（🍃×総量）。消費済みは淡色、消費した瞬間の1個は拡大＋フェードアウトで消える（600ms） */
+#hRescue{font-size:17px;line-height:1.2;letter-spacing:2px;white-space:nowrap}
+#hRescue .ri{display:inline-block}
+#hRescue .ri.off{opacity:.28;filter:grayscale(1)}
+#hRescue .ri.gone{animation:rescueGone .6s ease-out forwards}
+@keyframes rescueGone{0%{transform:scale(1);opacity:1;filter:none}35%{transform:scale(1.8);opacity:.9}100%{transform:scale(2.2);opacity:0;filter:grayscale(1)}}
 #hBest .near{font-size:15px;font-weight:900;color:#ffe45e}
 #hCombo .fv{font-size:13px;margin-left:8px;color:#ffb347;letter-spacing:.04em;white-space:nowrap}
 #ovTitle .panel{max-width:1100px}
@@ -142,6 +148,7 @@ h2{margin:6px 0 10px;font-size:22px}
 <div id="hud">
   <div class="hudL" id="hudL">
     <div id="hDist">0.0<small>m</small></div>
+    <div id="hRescue"></div>
     <div id="hBest"></div>
     <div id="hAir"></div>
     <div id="hCombo"></div>
@@ -311,6 +318,18 @@ const KaeruCore = (() => {
     timing: { bounceMs: 80, hitstopMs: 35, hitstopLeafMs: { L: 0, M: 10, S: 20, gold: 28 }, hitstopTopMs: 7, sinkMs: 400, retryMs: 500, nearMissPoseMs: 40, maxFrameGapMs: 250 },
     assist: { enabled: true, landings: 3, windowMul: 1.5 },
     milestones: [100, 250, 500], milestoneStep: 500, bestLineNear: 50,
+    // r55 問題1：安全葉の救済（CONSULT_R55_FINAL.md）。r56 で締め直し（CONSULT_R56_FINAL.md）。
+    //   救済状態＝強（その飛行の離陸が水切り復帰）／弱（その飛行の離陸の最終速度〔床・花の保留分込み〕が weakV 未満）。
+    //   weakV は弱救済の発動閾値で、床の値（floorP）とは独立（r55 は floorP を兼用していたため、床だけ変えると発動範囲まで動いた）。
+    //   救済状態の飛行で安全葉に着地したときだけ、判定窓の距離係数を 強 max(現行, strongWin)／弱 max(現行, weakWinMin) にし、
+    //   PERFECT（MIRACLE も同じ）／GOOD の離陸の実速度に床 floorP／floorG（弱は ×weakMul）を max で掛ける（NONE は床なし）。
+    //   r56：救済は1プレイ stock 回の総量制（強・弱で共有、補充なし。r55 の連続 maxChain 回の制限は廃止）。残数 0 では窓も床も効かない。
+    //   消費は着地の確定時点で、窓の緩和で判定が上がった／床で最終離陸速度が上がった、のどちらか（両方でも1回）のときだけ。
+    //   値（窓 0.65／0.45、床 840／700、弱 ×0.9、閾値 900、3回）は CONSULT_R56_FINAL.md の確定値。enabled=false で r54 と同じ
+    rescue: { enabled: true, floorP: 840, floorG: 700, weakMul: 0.9, weakV: 900, stock: 3, strongWin: 0.65, weakWinMin: 0.45 },
+    // r55 問題4：ダイブ発動後〜その飛行の着地までに取った赤花の加速は、その場で掛けず（保証葉も動かさず）次の離陸で一度だけ足す。
+    //   足す量は取得時点の現行式（flowerBoost：min(1.3×sp, max(上限, sp))）の増分。enabled=false で r54 と同じ（即時加速）
+    divePendingFlower: { enabled: true },
   };
 
   /* ===== カエル図鑑（params=固有能力 / cheer=応援で上書きされる値） ===== */
@@ -558,6 +577,10 @@ const KaeruCore = (() => {
     const capSpeed = () => (fever && C.fever.maxSpeed != null ? C.fever.maxSpeed : C.maxSpeed);
     let glideLeft = 0, brakeLeft = 0;
     let diveUsed = false, diveStartY = null, refIn = null, sunkAfterDive = false;
+    // r55：pendingBoost＝ダイブ中の赤花の保留分（実速度 px/s の加算値。次の離陸で一度だけ使う）、
+    //   tkRescue＝この飛行の救済状態（'strong'＝水切り復帰の離陸／'weak'＝離陸の最終速度が C.rescue.weakV 未満／null）、
+    //   rescueLeft＝r56：このプレイの救済の残数（走の開始で C.rescue.stock。消費は着地の確定時点。補充なし）
+    let pendingBoost = 0, tkRescue = null, rescueLeft = 0;
     let maxX = C.startX, nextMs = C.milestones[0], bestAtStart = 0, bestPassed = false;
     let landings = 0, firstPlay = false, stats = null, result = null;
     let nextC = null, nextDirty = true, imminentFired = false;
@@ -700,6 +723,20 @@ const KaeruCore = (() => {
       const sp = Math.hypot(p.vx, p.vy);
       if (sp > cap) { p.vx *= cap / sp; p.vy *= cap / sp; }
     };
+    // r55 問題4：状態 p で赤花を取ったときの実効増分（px/s）。現行の flowerBoost をそのまま当てた前後の速さの差（上限超過中は 0）
+    const flowerBoostGain = p => { const q = { x: p.x, y: p.y, vx: p.vx, vy: p.vy }, s0 = Math.hypot(q.vx, q.vy); flowerBoost(q); return Math.max(0, Math.hypot(q.vx, q.vy) - s0); };
+    const pendOn = () => !!(C.divePendingFlower && C.divePendingFlower.enabled);
+    const pendFlowers = () => pendOn() && diveUsed;
+    // r55 問題1＋4：離陸の実速度の仕上げ。素の実速度 va0 に救済の床 floor を max で掛け（床 → 保留分の順）、保留分 pb をその離陸の上限 cap まで足す
+    //   （すでに上限以上なら足さない＝花の現行式と同じ考え方）。副作用なし（judge の先回り予測と takeoff の両方が使う）
+    const finishLaunch = (va0, floor, pb, cap) => {
+      let va = va0, floorUsed = false;
+      if (floor > 0 && va < floor) { va = floor; floorUsed = true; }
+      const vaF = va;
+      if (pb > 0 && va < cap) va = Math.min(cap, va + pb);
+      return { va, vaF, floorUsed, boost: va - vaF };
+    };
+    const rescueOn = () => !!(C.rescue && C.rescue.enabled);
     // 状態 p でダイブを発動したときの、葉の高さへの下降交点（花・葉は見ない。範囲の計算用）
     const diveLand = p => {
       const sp = Math.hypot(p.vx, p.vy), q = { x: p.x, y: p.y, vx: sp * cosD, vy: -sp * sinD };
@@ -758,7 +795,7 @@ const KaeruCore = (() => {
         if (downCross(q, NORMAL, 0) <= h) return null;
         if (fl) {
           const th = flowerHitTime(NORMAL, h, q, fl);
-          if (th != null) { move(q, NORMAL, th); t += th; tp += th; flowerBoost(q); fl = null; continue; }
+          if (th != null) { move(q, NORMAL, th); t += th; tp += th; if (!pendOn()) flowerBoost(q); fl = null; continue; }   // r55：ダイブ後の赤は保留（速度は変わらない）
         }
         move(q, NORMAL, h); t += h; tp += h;
       }
@@ -1119,7 +1156,12 @@ const KaeruCore = (() => {
         if (f.taken) continue; // 白の組で先に1輪取ると、残りは散っている
         f.taken = true;
         const q = cp(b); move(q, m, th);
-        if (f.kind === 'red') {
+        if (f.kind === 'red' && pendFlowers()) {
+          // r55 問題4：ダイブ中の赤は保留。速度はその場で変えず（保証葉も動かさない）、取得時点の現行式の増分を pendingBoost に足す
+          const before = { vx: b.vx, vy: b.vy }, gain = flowerBoostGain(b); pendingBoost += gain; fstats.red += 1;
+          emit('flowerGet', { id: f.id, group: f.group, kind: 'red', value: f.value, big: f.big, mul: 1, before, after: { vx: b.vx, vy: b.vy }, x: q.x, y: q.y, state, cheer: !!f.cheer,
+            pending: true, pendingGain: gain, pendingBoost });
+        } else if (f.kind === 'red') {
           const before = { vx: b.vx, vy: b.vy }; flowerBoost(b); fstats.red += 1; nextDirty = true;
           emit('flowerGet', { id: f.id, group: f.group, kind: 'red', value: f.value, big: f.big, mul: 1.3, before, after: { vx: b.vx, vy: b.vy }, x: q.x, y: q.y, state, cheer: !!f.cheer });
         } else {
@@ -1163,7 +1205,7 @@ const KaeruCore = (() => {
         }
         if (hit) {
           move(q, NORMAL, hit.th); elapsed += hit.th; taken.add(hit.f.id);
-          if (hit.f.kind === 'red') { flowerBoost(q); approx = true; }
+          if (hit.f.kind === 'red' && !pendOn()) { flowerBoost(q); approx = true; }   // r55：ダイブ後の赤は保留（速度も保証葉も変わらない）
           continue;
         }
         move(q, NORMAL, h); elapsed += h;
@@ -1251,9 +1293,17 @@ const KaeruCore = (() => {
     // 頂点が葉の高さ 120px に届かず、救済が必ず失敗するため
     // r39：E＝葉バウンドの上限超過分（launchV 経由。発射・水切り復帰は 0）。launchScale は従来の式のままなので超過は次のバウンドに持ち越されない
     // r47：cap＝judge で決めた速度上限（launchV.cap。FEVER 中のバウンドは C.fever.maxSpeed）。省略は従来の C.maxSpeed
-    const takeoff = (v, fromLeaf, angleDeg = C.angleDeg, dived = false, E = 0, cap = C.maxSpeed) => {
-      const va = launchSpeedAt(v, fromLeaf ? rampScale(meters()) : 1, E, cap);
-      launchScale = v > 0 ? va / v : 1;
+    // r55：floor＝救済の床（judge が決める。0＝なし）、rescueKind＝床の元になった救済状態
+    //   noReset＝NONE 判定の着地からの離陸（launchV 互換のため残す。r56 で救済の残数は補充しないので救済には使わない）
+    const takeoff = (v, fromLeaf, angleDeg = C.angleDeg, dived = false, E = 0, cap = C.maxSpeed, floor = 0, rescueKind = null, noReset = false) => {
+      const va0 = launchSpeedAt(v, fromLeaf ? rampScale(meters()) : 1, E, cap);
+      launchScale = v > 0 ? va0 / v : 1;
+      // r55 問題1＋4：床 → 保留分の順に仕上げる（launchScale は素の実速度で決める＝次の接触の基準速度の換算は従来どおり）
+      const pbIn = pendingBoost, fin = finishLaunch(va0, floor, pbIn, cap), va = fin.va;
+      pendingBoost = 0;
+      // r56：残数の消費は着地（resolve）で確定済み。ここでは増減しない（床に頼らない離陸でも補充しない）。
+      //   弱の判定は床とは独立の閾値 weakV で、床・保留分まで反映した最終離陸速度 va を比べる
+      tkRescue = !rescueOn() ? null : !fromLeaf ? 'strong' : va < C.rescue.weakV ? 'weak' : null;
       if (angleDeg === C.angleDeg) { b.vx = va * cosA; b.vy = va * sinA; }
       else { b.vx = va * Math.cos(angleDeg / DEG); b.vy = va * Math.sin(angleDeg / DEG); }
       // 基準の入射角：この離陸の無操作軌道（通常物理）が葉の高さへ下降交差する点での入射角
@@ -1280,7 +1330,9 @@ const KaeruCore = (() => {
       }
       leaves = leaves.filter(l => l.x > b.x - C.leaf.cullBehind);
       setState('FLYING');
-      if (v < C.leaf.minSpeed) {
+      // r55：床・保留分で持ち上げた離陸は、その分だけ基準速度も上がったとみなして最低速度を判定する（持ち上げがなければ従来の v そのもの）
+      const vChk = va === va0 ? v : va0 > 0 ? v * va / va0 : v;
+      if (vChk < C.leaf.minSpeed) {
         guarEligible = false; noGen = true;
         const r = predict(false, true), xr = r ? r.x : b.x, ids = [];
         for (const lf of leaves) {
@@ -1296,6 +1348,9 @@ const KaeruCore = (() => {
         if (fromLeaf) { ensureAimLeaf(va); spawnFlower(); if (fl5()) spawnFlowers35(); }
       }
       emit('takeoff', { speed: va, baseSpeed: v, rampScale: launchScale, fromLeaf, x: b.x, y: b.y, angleDeg, refInDeg: refIn, dived, softcapE: E,
+        ...(fin.floorUsed ? { rescueFloor: floor, rescueKind, rescueLeft, speedNoFloor: va0 } : {}),   // r55：救済の床を使った離陸だけ（r56：rescueLeft＝消費後の残数）
+        ...(pbIn > 0 ? { pendingBoost: fin.boost, pendingIn: pbIn, speedBeforeBoost: fin.vaF } : {}),  // r55：保留した赤花を使った離陸だけ
+        ...(tkRescue ? { rescue: tkRescue } : {}),
         ...(glideRefillMs > 0 ? { glideRefillMs } : {}), // r40：水切り復帰で回復した滑空の量（回復したときだけ載せる＝既存系統のイベントは r39 と同じ形）
         seq: tkSeq, aimRange: aimRange0 ? { x0: aimRange0.x0, x1: aimRange0.x1, wx0: aimRange0.wx0, wx1: aimRange0.wx1, covered: aimRange0.covered || 0, placed: aimRange0.placed || null, blocked: !!aimRange0.blocked } : null });
     };
@@ -1442,8 +1497,9 @@ const KaeruCore = (() => {
       let first = Infinity, firstFlower = null;
       for (const f of flowers) if (!f.taken) { const th = segHit(b, m, tEnd, f, R5.flowers.radius); if (th != null && th < first) { first = th; firstFlower = f; } }
       if (first < Infinity) {
+        const pended = firstFlower.kind === 'red' && pendFlowers();   // r55：保留した赤では保証葉を動かさない
         advance(first, m); pickFlowers(m, 0, [[0, firstFlower]]);
-        if (firstFlower.kind === 'red') updateGuarantee();
+        if (firstFlower.kind === 'red' && !pended) updateGuarantee();
         return first;
       }
       if (cKind === 'leaf') { advance(tEnd, m); b.y = C.leafY; contact('leaf', cLeaf); return tEnd; }
@@ -1506,9 +1562,18 @@ const KaeruCore = (() => {
         if (d >= -C.judge.good - 1e-6) resolve(d);
       }
     }
-    const windowMul = p => {
+    // r55：この飛行の安全葉 lf への着地が救済の対象なら救済状態（'strong'／'weak'）を返す。
+    //   r56：残数 0 なら対象外（窓の緩和も床もこのゲートを通るので、使い切った後はどちらも一切効かない）
+    const rescueAt = lf => (rescueOn() && rescueLeft > 0 && tkRescue && isSafe(lf) ? tkRescue : null);
+    // r56：noRescue＝救済の緩和を使わない窓（消費の判定で「緩和なしなら何判定だったか」を求めるため）
+    const windowMul = (p, noRescue = false) => {
       const d = Math.max(0, p.x - C.startX) / C.pxPerMeter;
-      let w = (1 - C.judge.farShrink * clamp(d / C.judge.farMeters, 0, 1)) * F.windowMul;
+      let df = 1 - C.judge.farShrink * clamp(d / C.judge.farMeters, 0, 1);
+      // r55 問題1：救済状態の飛行で安全葉に着地したときだけ、距離係数を緩める（強＝下限 strongWin、弱＝下限 weakWinMin。r56 で 0.65／0.45）
+      const rk = p.kind === 'leaf' && !noRescue ? rescueAt(p.leaf) : null;
+      if (rk === 'strong') df = Math.max(df, C.rescue.strongWin);
+      else if (rk === 'weak') df = Math.max(df, C.rescue.weakWinMin);
+      let w = df * F.windowMul;
       if (p.kind === 'leaf' && p.leaf.size === 'S') w *= F.smallLeafWindowMul;
       if (p.kind === 'leaf' && firstPlay && C.assist.enabled && landings < C.assist.landings) w *= C.assist.windowMul;
       return w;
@@ -1521,13 +1586,20 @@ const KaeruCore = (() => {
       return [e, l];
     };
     // grade は 'NONE'／'GOOD'／'PERFECT'／'MIRACLE'。MIRACLE は PERFECT 窓の内側だけ（PERFECT として数える：c+1・f+1・コンボ倍率・ヒットストップ）
-    function resolve(delta) {
-      const p = pend, J = C.judge, wm = windowMul(p), mw = mi5() ? miracleWin(wm) : null, MI = R5.miracle;
+    // r56：押下のずれ delta と窓係数 wm から判定を決める（resolve の判定と、消費判定用の「緩和なしの判定」が同じ式を使う）
+    const gradeAt = (delta, wm) => {
+      const J = C.judge, mw = mi5() ? miracleWin(wm) : null;
       let grade = 'NONE';
       if (delta != null && Math.abs(delta) <= J.good + 1e-6) {
         grade = delta >= J.perfectEarly * wm && delta <= J.perfectLate * wm ? 'PERFECT' : 'GOOD';
         if (grade === 'PERFECT' && mw && delta >= mw[0] && delta <= mw[1]) grade = 'MIRACLE';
       }
+      return grade;
+    };
+    const GRADE_RANK = { NONE: 0, GOOD: 1, PERFECT: 2, MIRACLE: 3 };
+    function resolve(delta) {
+      const p = pend, J = C.judge, wm = windowMul(p), mw = mi5() ? miracleWin(wm) : null, MI = R5.miracle;
+      const grade = gradeAt(delta, wm);
       const top = grade === 'PERFECT' || grade === 'MIRACLE';
       if (delta != null) {
         stats.presses++; stats.sum += delta;
@@ -1590,8 +1662,20 @@ const KaeruCore = (() => {
           if (rate > 0 && v > 0) { const vB = Math.min(cap, v * (1 + rate)); diveBonusPct = (vB - v) / v * 100; v = vB; }
         }
         const angleOut = bounceAngle(p.inAngle, refIn); // 入射角バウンド（葉のみ）
-        launchV = { v, fromLeaf: true, angleDeg: angleOut, dived: p.dived, E, cap };
-        const vaNext = launchSpeedAt(v, rampScale(meters()), E, cap); // 次の離陸の実速度（takeoff と同じ式）
+        // r55 問題1：救済状態の飛行の安全葉で PERFECT／MIRACLE／GOOD なら床を付ける（NONE は床なし。r51 の safeMulDive より優先＝max）
+        //   r56：残数のゲートは rescueAt（残数 0 なら rk＝null で床も付かない）
+        const rk = rescueAt(leaf), RS = C.rescue;
+        const floor = rk && grade !== 'NONE' ? (grade === 'GOOD' ? RS.floorG : RS.floorP) * (rk === 'weak' ? RS.weakMul : 1) : 0;
+        launchV = { v, fromLeaf: true, angleDeg: angleOut, dived: p.dived, E, cap, floor, rescueKind: rk, noReset: grade === 'NONE' };
+        const vaNext0 = launchSpeedAt(v, rampScale(meters()), E, cap); // 次の離陸の素の実速度（takeoff と同じ式）
+        const vaNext = floor > 0 || pendingBoost > 0 ? finishLaunch(vaNext0, floor, pendingBoost, cap).va : vaNext0;   // r55：床・保留分込み
+        // r56：消費の確定（着地時点）。結果が実際に変わったときだけ1回：
+        //   判定＝緩和なしの窓での判定（gradeBase）より上がった、または 速度＝床なし（保留分・上限は同じ）の最終離陸速度より上がった。
+        //   両方でも1回。上限に張り付いて床が吸収された場合などは消費しない
+        const gradeBase = rk ? gradeAt(delta, windowMul(p, true)) : grade;
+        const rescueUsed = !!rk && (GRADE_RANK[grade] > GRADE_RANK[gradeBase]
+          || vaNext > (pendingBoost > 0 ? finishLaunch(vaNext0, 0, pendingBoost, cap).va : vaNext0) + 1e-9);
+        if (rescueUsed) rescueLeft--;
         stateT = C.timing.bounceMs; hitstop = hitstopMsFor(leaf.size, leaf.gold, grade, safe);   // r46：葉倍率×判定の表（演出専用）
         lastGrade = grade; lastNearMiss = p.nearMiss;
         // r37 BIG AIR：葉の接触は判定によらず記録対象。比較は丸め前の値。全体ベストが 0 のプレイでは更新演出を出さない
@@ -1616,7 +1700,7 @@ const KaeruCore = (() => {
           glideMs: p.glideMs, glided, airPure: !glided, airPureRun, // r39 BIG AIR v2
           highM, highRun, highRecord, highRecordFirst, highStart,
           glideAir: gOn, glideRun, glideRecord, glideRecordFirst, glideStart,
-          softcapE: E, softcapPct: vaNext > cap ? (vaNext - cap) / cap : 0, // r39 ソフトキャップ（r47：基準は現在の上限）
+          softcapE: E, softcapPct: vaNext0 > cap ? (vaNext0 - cap) / cap : 0, // r39 ソフトキャップ（r47：基準は現在の上限）
           kind: 'leaf', grade, deltaMs: delta, combo, leafId: leaf.id, size: leaf.size, gold: leaf.gold,
           nearMiss: p.nearMiss, x: p.x, speedIn: p.speed, speedOut: v, fever, feverChain: feverDistances.length,
           distance: meters(), windowMs: [J.perfectEarly * wm, J.perfectLate * wm],
@@ -1625,6 +1709,7 @@ const KaeruCore = (() => {
           safe, safeMul: sm, feverApplied: !safe && fever, aimLeaf: !!leaf.aim, // r3.2
           safeLeaf, miracle: grade === 'MIRACLE', miracleMs: mw, pinch, speedBase: vIn,  // r3.5
           diveBonusPct, diveDropM: p.diveDropM || 0,  // r48
+          ...(rk ? { rescue: rk, rescueFloor: floor > 0 ? floor : null, rescueLeft, rescueUsed, rescueGradeBase: gradeBase } : {}),   // r55：救済の対象の着地だけ（窓の緩和込み）。r56：消費後の残数・消費したか・緩和なしの判定
         });
       } else {
         // r3.5：MIRACLE の水切りは優遇復帰 clamp(v*×0.7, 800, 1200)（v* はピンチ補正後）。それ以外は r3.2 のまま
@@ -1633,7 +1718,7 @@ const KaeruCore = (() => {
           : clamp(p.speed * F.skipFactor, C.skip.min, C.skip.max);
         if (grade === 'MIRACLE') stats.miracleWater++;
         emit('judge', { kind: 'water', grade, deltaMs: delta, success, combo: 0, x: p.x, speedIn: p.speed, speedOut: v, distance: meters(),
-          angleOutDeg: C.angleDeg, dived: p.dived, speedOutAct: v, miracle: grade === 'MIRACLE', miracleMs: mw, skipsLeft: skipStock }); // 水切り復帰はランプなし
+          angleOutDeg: C.angleDeg, dived: p.dived, speedOutAct: success && pendingBoost > 0 ? finishLaunch(v, 0, pendingBoost, C.maxSpeed).va : v, miracle: grade === 'MIRACLE', miracleMs: mw, skipsLeft: skipStock }); // 水切り復帰はランプなし
         if (success) {
           launchV = { v, fromLeaf: false, angleDeg: C.angleDeg, dived: false };
           stateT = C.timing.bounceMs; hitstop = 0; lastGrade = grade; lastNearMiss = false;
@@ -1680,7 +1765,7 @@ const KaeruCore = (() => {
             break;
           case 'BOUNCING': case 'WATER_SKIP':
             stateT -= u; left -= u; hitstop = Math.max(0, hitstop - u);
-            if (stateT <= 1e-9) takeoff(launchV.v, launchV.fromLeaf, launchV.angleDeg, launchV.dived, launchV.E || 0, launchV.cap || C.maxSpeed);
+            if (stateT <= 1e-9) takeoff(launchV.v, launchV.fromLeaf, launchV.angleDeg, launchV.dived, launchV.E || 0, launchV.cap || C.maxSpeed, launchV.floor || 0, launchV.rescueKind || null, !!launchV.noReset);
             break;
           case 'SINKING':
             stateT -= u; left -= u; tJudge += u; retryT = Math.max(0, retryT - u);
@@ -1764,6 +1849,7 @@ const KaeruCore = (() => {
       combo = 0; maxCombo = 0; feverDistances.length = 0; fever = false; feverLeft = 0; feverElapsed = 0;
       glideLeft = F.glide ? F.glide.ms / 1000 : 0; brakeLeft = 0;
       diveUsed = false; diveStartY = null; refIn = null; sunkAfterDive = false;
+      pendingBoost = 0; tkRescue = null; rescueLeft = rescueOn() ? C.rescue.stock : 0;   // r55：保留分と救済は走ごとに捨てる（r56：残数は走ごとに stock へ）
       maxX = C.startX; nextMs = C.milestones[0]; bestAtStart = prof.best; bestPassed = false;
       landings = 0; firstPlay = prof.best === 0 && prof.total === 0;
       tkX = C.startX; airRunBest = 0; airRunAt = 0; airRecorded = false;
@@ -1871,6 +1957,8 @@ const KaeruCore = (() => {
         hitstopMs: hitstop, brakeLeftMs: Math.max(0, brakeLeft) * 1000,
         canRetry: state === 'GAME_OVER' && retryT <= 0,
         assist: firstPlay && C.assist.enabled && landings < C.assist.landings,
+        pendingBoost, rescue: tkRescue,   // r55：保留中の赤花の加速（px/s）・この飛行の救済状態
+        rescueLeft, rescueStock: rescueOn() ? C.rescue.stock : 0,   // r56：救済の残数と1プレイの総量（無効時は 0）
       };
       // r37 BIG AIR：airLive＝空中のときこの離陸からの水平距離（m）、airRef＝比較相手（全体ベストとこのプレイの最大の大きい方）、
       // airOver＝空中で比較相手を超えている（全体ベストが 0 のプレイでは出さない）
@@ -2171,94 +2259,222 @@ const SOUND_KEY = 'kaeru.soundMuted';
 function soundEnabled() {
   try { return localStorage.getItem(SOUND_KEY) !== '1'; } catch (_) { return true; }
 }
-// r44：BGM はステージごとの曲を2要素デッキでクロスフェード。FEVER 中は FEVER 曲を最優先し、ステージ曲は音量0で裏再生を続ける。
+// r44：BGM はステージごとの曲を2要素デッキでクロスフェード。FEVER 中は FEVER 曲を最優先する。
+// r55（問題3・堅牢化）：
+//   ①フェード世代番号 media.gen：切替要求のたびに進める。フェードの進行・完了、遅れて解決した play() の継続は、
+//     自分の世代が最新でなければデッキに一切触れない（古いフェードが再利用済みのデッキを止める事故を防ぐ）。
+//   ②旧曲の保持：切替先デッキの再生が実際に始まる（play() の解決か playing イベント）まで、旧曲は絞らず止めない。
+//     フェード時間（BGM_FADE_MS／BGM_FEVER_FADE_MS）は再生開始を確認した後の時間。
+//   ③照合 bgmReconcile：「鳴るべき状態」（bgmDesired）と実状態（paused・currentTime の進行・volume・フェード）を突き合わせて直す。
+//     きっかけは visibilitychange（visible）・focus・pointerdown が主。定期チェックは健全なら 4 秒ごと、
+//     直しても直らない間は 1→2→4→8→16 秒とバックオフ（上限 16 秒）。play() の失敗はデッキの err に残し、次の照合で直す。
+//   ④FEVER 中の裏再生は廃止：FEVER 曲へのフェードが終わったらステージ曲は pause して位置を bgmPos に保存し、終了時に保存位置から再開する。
+//   ⑤診断ログ KaeruBgmLog：BGM の出来事を時刻つきで直近 50 件だけ持つ（window.KaeruBgmLog、KaeruBgmLog.dump() で文字列）。
 const BGM_VOL = 0.16, BGM_FADE_MS = 1600, BGM_FEVER_FADE_MS = 350;
+const BGM_LOG_MAX = 50, BGM_WATCH_MS = 4000, BGM_RETRY_MS = 1000, BGM_RETRY_MAX_MS = 16000, BGM_STALL_MS = 1500, BGM_SEEK_TOL_S = 0.25;
 let media = null, bgmTrack = 'bgm_stage1';
 let bgmFeverOn = false;
 const stageBgmTrack = () => 'bgm_stage' + (stageAt(Math.max(0, eng.view.hud.distance)) + 1);
+const BGM_LOG = [];
+BGM_LOG.dump = () => BGM_LOG.map(e => `${e.clock} +${e.t}ms ${e.ev}${e.info ? ' ' + JSON.stringify(e.info) : ''}`).join('\n');
+function bgmLog(ev, info) {
+  let clock = '';
+  try { clock = new Date().toISOString().slice(11, 23); } catch (_) {}
+  BGM_LOG.push({ t: Math.round(nowMs()), clock, ev, info: info || null });
+  while (BGM_LOG.length > BGM_LOG_MAX) BGM_LOG.shift();
+}
+if (typeof window !== 'undefined') window.KaeruBgmLog = BGM_LOG;
+const bgmVis = () => !(typeof document !== 'undefined' && document.hidden);
 function playMedia(player) {
-  // ブラウザが再生を保留・拒否した場合や、切替で play() が中断された場合に備える。
+  // 声の再生（BGM は bgmPlay が失敗を記録する）。ブラウザが再生を保留・拒否した場合や、play() が中断された場合に備える。
   player.play()?.catch(() => {});
+}
+// 鳴るべき状態（1か所で決める）：null＝何も鳴らさない（音 OFF・素材なし）。それ以外は { track, vol }
+function bgmDesired() {
+  if (!media || !AU.on) return null;
+  if (!media.sources.get(bgmTrack)) return null;
+  return { track: bgmTrack, vol: BGM_VOL };
+}
+function bgmSavePos(deck) {
+  if (deck.track && typeof deck.el.currentTime === 'number' && Number.isFinite(deck.el.currentTime)) media.bgmPos.set(deck.track, deck.el.currentTime);
+}
+function bgmPause(deck, why) {
+  if (!deck.el.paused) { bgmSavePos(deck); deck.el.pause(); bgmLog('pause', { track: deck.track, why, pos: media.bgmPos.get(deck.track) ?? null }); }
+  deck.el.volume = 0;
+}
+// 保存位置へのシーク（ずれが BGM_SEEK_TOL_S を超えるときだけ。シークは Android で間が空くことがあるので無駄打ちしない）
+function bgmSeekSaved(deck) {
+  const pos = media.bgmPos.get(deck.track);
+  if (pos == null) return;
+  const ct = deck.el.currentTime;
+  if (typeof ct === 'number' && Math.abs(ct - pos) <= BGM_SEEK_TOL_S) return;
+  try { deck.el.currentTime = pos; bgmLog('seek', { track: deck.track, pos }); } catch (e) { bgmLog('seekFail', { track: deck.track, err: e && e.name }); }
 }
 // デッキに曲を割り当てる（src が違う場合だけ差し替え、保存済みの再生位置があれば戻す）
 function assignBgmDeck(deck, track) {
   const src = media.sources.get(track);
   if (deck.el.getAttribute('src') !== src) {
-    if (deck.track && !deck.el.paused) media.bgmPos.set(deck.track, deck.el.currentTime || 0);
-    deck.el.pause();
+    bgmPause(deck, 'reassign');
     deck.el.src = src;
-    const pos = media.bgmPos.get(track);
-    if (pos != null) try { deck.el.currentTime = pos; } catch (_) {}
+    deck.track = track; deck.err = null; deck.ct = null;
+    bgmSeekSaved(deck);
   }
   deck.track = track;
+}
+// デッキの再生を求める。解決（または playing イベント）で、その世代のフェードがまだ待っていれば開始する。
+// 失敗はデッキの err に残して握りつぶさない（次の照合で直す）
+function bgmPlay(i, why) {
+  const deck = media.decks[i], gen = media.gen, track = deck.track;
+  deck.err = null; deck.tryT = nowMs(); deck.pending = gen;   // pending＝結果待ち（play() 直後は paused が false でも鳴っているとは限らない）
+  bgmLog('play', { track, why, gen });
+  let p = null;
+  try { p = deck.el.play(); } catch (e) { deck.pending = null; deck.err = (e && e.name) || 'Error'; bgmLog('playFail', { track, err: deck.err, gen }); return; }
+  const ok = () => {
+    if (deck.pending === gen) deck.pending = null;
+    if (gen !== media.gen) { bgmLog('playLate', { track, gen, now: media.gen }); return; }   // 古い世代：何もしない
+    deck.err = null;
+    bgmLog('playOk', { track, gen });
+    bgmFadeStart(i);
+  };
+  if (p && typeof p.then === 'function') p.then(ok, e => {
+    const err = (e && e.name) || 'Error';
+    if (deck.pending === gen) deck.pending = null;
+    if (gen === media.gen && deck.track === track) deck.err = err;
+    bgmLog('playFail', { track, err, gen, stale: gen !== media.gen });
+  });
+  else ok();
+}
+// 切替先 i が鳴り始めた：待っているフェードがあれば時計を進め始める
+function bgmFadeStart(i) {
+  const f = media.fade;
+  if (!f || f.gen !== media.gen || f.to !== i || f.t0 != null) return;
+  if (media.decks[i].track !== f.toTrack) return;
+  f.t0 = nowMs();
+  bgmLog('fadeStart', { from: media.decks[f.from].track, to: f.toTrack, dur: f.dur, gen: f.gen });
 }
 function syncBgm(track = bgmTrack, fadeMs = BGM_FADE_MS) {
   bgmTrack = track;
   if (!media) return;
   const { decks, sources } = media;
   if (!AU.on) {
-    media.fade = null;
-    decks[1 - media.cur].el.pause();
-    decks[media.cur].el.pause();
+    media.gen++; media.fade = null;
+    bgmLog('request', { track, muted: true, gen: media.gen });
+    bgmPause(decks[1 - media.cur], 'mute');
+    bgmPause(decks[media.cur], 'mute');
     return;
   }
   if (!sources.get(track)) return;
-  if (media.fade) {
-    if (media.fade.toTrack === track) return;
-    finishBgmFade();
+  const f0 = media.fade;
+  if (f0 && f0.toTrack === track && f0.gen === media.gen) return;   // 同じ曲への切替が進行中（新しい要求ではない）
+  media.gen++;
+  bgmLog('request', { track, fadeMs, gen: media.gen });
+  if (f0) {
+    // 進行中の切替を打ち切る。まだ鳴り始めていなければ旧曲側が「いま聞こえているデッキ」、始まっていれば大きい方を残す
+    media.cur = f0.t0 == null ? f0.from : decks[f0.from].el.volume > decks[f0.to].el.volume ? f0.from : f0.to;
+    media.fade = null;
   }
   const cur = decks[media.cur];
-  if (cur.track === track) {
-    cur.el.volume = BGM_VOL;
-    if (cur.el.paused) playMedia(cur.el);
-    return;
-  }
-  if (cur.track === null) {
-    assignBgmDeck(cur, track);
-    cur.el.volume = BGM_VOL;
-    playMedia(cur.el);
-    return;
-  }
-  const from = media.cur, to = 1 - from, next = decks[to];
-  assignBgmDeck(next, track);
+  let from, to;
+  if (cur.track === track) { to = media.cur; from = 1 - to; }
+  else if (decks[1 - media.cur].track === track || cur.track !== null || !cur.el.paused) { from = media.cur; to = 1 - from; }
+  else { to = media.cur; from = 1 - to; }   // 最初の1曲（どちらのデッキも空き）
+  const A = decks[from], B = decks[to];
+  if (B.track !== track) assignBgmDeck(B, track);
+  else if (B.el.paused) bgmSeekSaved(B);   // r55：FEVER 明けなど、止めておいたステージ曲を保存位置から再開する
+  const fromOn = !A.el.paused && A.el.volume > 0;
   media.cur = to;
-  next.el.volume = 0;
-  next.el.pause();
-  playMedia(next.el);
-  media.fade = { from, to, toTrack: track, t0: nowMs(), dur: Math.max(1, fadeMs), vFrom: cur.el.volume, keepFrom: track === 'bgm_fever' };
+  media.fade = { gen: media.gen, from, to, toTrack: track, t0: null, tReq: nowMs(), dur: fromOn ? Math.max(1, fadeMs) : 1,
+    vFrom: fromOn ? A.el.volume : 0, vTo0: B.el.paused ? (fromOn ? 0 : BGM_VOL) : B.el.volume };
+  if (B.el.paused || B.pending != null) { B.el.volume = fromOn ? 0 : BGM_VOL; bgmPlay(to, 'switch'); }
+  else bgmFadeStart(to);   // 切替先はすでに鳴っている（打ち切った切替の旧曲側など）
 }
-function finishBgmFade() {
-  const f = media && media.fade; if (!f) return;
+function finishBgmFade(f = media && media.fade) {
+  if (!f) return;
+  if (f !== media.fade || f.gen !== media.gen) { bgmLog('fadeStale', { to: f.toTrack, gen: f.gen, now: media.gen }); return; }   // 古い世代の完了処理はデッキに触れない
   media.fade = null;
   const { decks } = media, a = decks[f.from], b = decks[f.to];
   b.el.volume = BGM_VOL;
-  if (f.keepFrom) { a.el.volume = 0; return; }
-  if (a.track) media.bgmPos.set(a.track, a.el.currentTime || 0);
-  a.el.pause();
-  a.el.volume = 0;
+  bgmPause(a, 'fadeEnd');   // r55：FEVER 中もステージ曲を裏で鳴らさない（pause＋位置保存）
+  bgmLog('fadeEnd', { to: f.toTrack, gen: f.gen });
 }
 function stepBgmFade() {
-  const f = media && media.fade; if (!f) return;
+  const f = media && media.fade; if (!f || f.t0 == null) return;   // 切替先が鳴り始めるまでは旧曲をそのまま
+  if (f.gen !== media.gen) { media.fade = null; return; }
   const k = Math.min(1, Math.max(0, (nowMs() - f.t0) / f.dur));
   media.decks[f.from].el.volume = f.vFrom * (1 - k);
-  media.decks[f.to].el.volume = BGM_VOL * k;
+  media.decks[f.to].el.volume = f.vTo0 + (BGM_VOL - f.vTo0) * k;
   if (k >= 1) finishBgmFade();
 }
-// FEVER 中にステージ境界を越えたら、裏デッキ（ステージ曲側）を新しいステージ曲に差し替えて音量0のまま再生を続ける
-function bgmStageBackground(stageTrack) {
-  if (!media || media.fade || !AU.on || !media.sources.get(stageTrack)) return;
-  const back = media.decks[1 - media.cur];
-  if (back.track === stageTrack) { if (back.el.paused) playMedia(back.el); return; }
-  assignBgmDeck(back, stageTrack);
-  back.el.volume = 0;
-  playMedia(back.el);
+// 照合：鳴るべき状態と実状態を突き合わせ、ずれていれば直す。直した（直そうとした）件数を返す
+function bgmReconcile(why) {
+  if (!media) return 0;
+  const { decks } = media, want = bgmDesired(), t = nowMs();
+  let fixes = 0;
+  const fix = (what, info) => { fixes++; bgmLog('fix', Object.assign({ what, why }, info)); };
+  if (!want) {
+    for (const d of decks) if (!d.el.paused) { fix('stop', { track: d.track }); bgmPause(d, 'reconcile'); }
+    return fixes;
+  }
+  if (!bgmVis()) return 0;   // 裏に回っている間は直さない（表示の復帰で照合する）
+  const f = media.fade;
+  if (f && f.gen === media.gen) {
+    const B = decks[f.to], A = decks[f.from];
+    if (f.t0 == null) {
+      // 切替待ち：切替先が鳴っていない（失敗が残っている／長く応答がない）なら掛け直す。旧曲が止められていたら戻す
+      if (B.el.paused || B.err || (B.pending != null && t - (B.tryT || 0) >= 2500)) { fix('retrySwitch', { track: B.track, err: B.err }); bgmPlay(f.to, 'reconcile'); }
+      if (A.track && A.el.paused && f.vFrom > 0) { fix('holdOld', { track: A.track }); bgmPlay(f.from, 'hold'); }
+    }
+    return fixes;
+  }
+  const cur = decks[media.cur], other = decks[1 - media.cur];
+  if (cur.track !== want.track) { fix('track', { have: cur.track, want: want.track }); syncBgm(want.track, BGM_FADE_MS); return fixes; }
+  if (cur.el.paused || (cur.pending != null && t - (cur.tryT || 0) >= 2500)) { fix('resume', { track: cur.track, err: cur.err }); cur.el.volume = want.vol; bgmPlay(media.cur, 'reconcile'); }
+  else {
+    if (Math.abs(cur.el.volume - want.vol) > 1e-3) { fix('volume', { track: cur.track, vol: cur.el.volume }); cur.el.volume = want.vol; }
+    // 再生中のはずなのに位置が進まない（止まっている）：止めてから掛け直す
+    const ct = cur.el.currentTime;
+    if (typeof ct === 'number' && Number.isFinite(ct)) {
+      if (cur.ct != null && ct === cur.ct && t - cur.ctT >= BGM_STALL_MS) {
+        fix('stall', { track: cur.track, pos: ct });
+        try { cur.el.pause(); } catch (_) {}
+        bgmPlay(media.cur, 'stall');
+        cur.ct = null;
+      } else if (cur.ct == null || ct !== cur.ct) { cur.ct = ct; cur.ctT = t; }
+    }
+  }
+  if (!other.el.paused) { fix('stopOther', { track: other.track }); bgmPause(other, 'reconcile'); }
+  return fixes;
 }
+// 定期チェック（frame から）。健全なら BGM_WATCH_MS ごと、直している間はバックオフ（上限 BGM_RETRY_MAX_MS）
+function bgmWatch(t) {
+  if (!media) return;
+  if (media.watchT == null) { media.watchT = t + BGM_WATCH_MS; return; }
+  if (t < media.watchT) return;
+  const n = bgmReconcile('timer');
+  if (n > 0) media.retryMs = Math.min(BGM_RETRY_MAX_MS, media.retryMs ? media.retryMs * 2 : BGM_RETRY_MS);
+  else media.retryMs = 0;
+  media.watchT = t + (media.retryMs || BGM_WATCH_MS);
+}
+// 復帰のきっかけ（表示・フォーカス・タップ）：すぐ照合し、バックオフを解く
+function bgmKick(why) {
+  if (!media) return;
+  media.retryMs = 0; media.watchT = nowMs() + BGM_WATCH_MS;
+  bgmReconcile(why);
+}
+if (typeof document !== 'undefined' && document.addEventListener) {
+  document.addEventListener('visibilitychange', () => {
+    if (!media) return;
+    bgmLog('visibility', { hidden: !!document.hidden });
+    if (!document.hidden) bgmKick('visible');
+  });
+  document.addEventListener('pointerdown', () => bgmKick('pointerdown'), { passive: true });
+}
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('focus', () => bgmKick('focus'));
 function updateBgm(v) {
   if (!media) return;
   const stageTrack = 'bgm_stage' + (stageAt(Math.max(0, v.hud.distance)) + 1);
   const want = bgmFeverOn ? 'bgm_fever' : v.state === 'TITLE' ? 'bgm_stage1' : stageTrack;
   if (want !== bgmTrack) syncBgm(want, want === 'bgm_fever' || bgmTrack === 'bgm_fever' ? BGM_FEVER_FADE_MS : BGM_FADE_MS);
-  else if (bgmFeverOn) bgmStageBackground(stageTrack);
 }
 // r44：相棒の声は場面ごとのスロット（<girl>_<slot>_<連番>）。連番はスロットごとのシャッフルバッグで選ぶ。
 const VOICE_SLOTS = { sendoff: 6, welcome_back: 5, new_record: 4, cheer_small: 10, cheer_mid: 6, cheer_big: 4, fever: 4, bigair: 4 };
@@ -2385,7 +2601,10 @@ function audioInit() {
       const sources = new Map(text.trim().split('\n').map(line => line.trim().split(' ')));
       const deckA = new Audio(), deckB = new Audio(), voice = new Audio();
       deckA.loop = true; deckB.loop = true; deckA.volume = BGM_VOL; deckB.volume = 0; voice.volume = 0.72;
-      media = { decks: [{ el: deckA, track: null }, { el: deckB, track: null }], cur: 0, fade: null, bgmPos: new Map(), voice, sources, voicePri: 0 };
+      // r55：gen＝フェード世代、err＝直近の play() 失敗名、ct/ctT＝照合で位置の進行を見る、watchT/retryMs＝定期チェックの予定とバックオフ
+      media = { decks: [{ el: deckA, track: null, err: null, pending: null, ct: null, ctT: 0, tryT: 0 }, { el: deckB, track: null, err: null, pending: null, ct: null, ctT: 0, tryT: 0 }],
+        cur: 0, fade: null, gen: 0, watchT: null, retryMs: 0, bgmPos: new Map(), voice, sources, voicePri: 0 };
+      media.decks.forEach((d, i) => { if (typeof d.el.addEventListener === 'function') d.el.addEventListener('playing', () => { d.pending = null; bgmLog('playing', { track: d.track }); bgmFadeStart(i); }); });
       voice.onended = () => { media.voicePri = 0; lastVoiceEndT = nowMs(); };   // r45：自然終了で優先度を戻し、終了時刻を記録
     }
   }
@@ -2455,6 +2674,10 @@ const SFX = {
   // r3.2：安全葉の着地（鈍い音）とロックオン（短いチッ音）
   safeLand(grade) { tone(150, 0.22, { to: 95, vol: 0.2 }); noiseBurst(0.12, { freq: 500, to: 220, vol: 0.12 }); if (grade === 'PERFECT') tone(440, 0.1, { type: 'triangle', vol: 0.07, at: 0.02 }); },
   lock() { tone(2200, 0.025, { type: 'square', vol: 0.035 }); },
+  // r55：安全葉の救済（速度の床）が付いた着地の短い上昇音
+  rescue() { tone(523, 0.08, { type: 'triangle', vol: 0.08, at: 0.05 }); tone(784, 0.1, { type: 'triangle', vol: 0.07, at: 0.11 }); },
+  // r56：救済を1回消費した着地（残数のアイコンが消える合図）。床のポップ音（上昇）と聞き分けられるよう、高い音から下がる2音＋小さな風切り
+  rescueUsed() { tone(1047, 0.07, { type: 'sine', vol: 0.09 }); tone(659, 0.16, { to: 494, type: 'sine', vol: 0.08, at: 0.07 }); noiseBurst(0.12, { freq: 3200, to: 1400, type: 'bandpass', vol: 0.05, at: 0.02 }); },
   // r37 BIG AIR：このプレイで初めて全体ベストを超えた着地だけ（2音の短い上昇音）
   bigAir() { tone(880, 0.1, { type: 'triangle', vol: 0.18 }); tone(1319, 0.1, { type: 'triangle', vol: 0.18, at: 0.1 }); },
   // r46：着地の二拍の1拍目「パシッ」（短い帯域ノイズ＋コンボ段のペンタトニックの音）。金葉は2倍音を小さく足す
@@ -2760,6 +2983,9 @@ const leafArtType = lf => (lf.gold ? 'G' : lf.size);
 /* ---- ハイビスカス（赤＝即効×1.3／青＝水切り+1）。挙動は r36 のまま、見た目だけ画像 ---- */
 // 画像の花の中心（画像比）と、花の半径に対する画像の横幅
 const FLOWER_ART = { red: 'hibiscus_red', white: 'hibiscus_blue', cx: .47, cy: .42, wMul: 2.9 };
+// r55 問題4：ダイブ中に取った赤（保留）の文言とオーラの色。問題1：救済の床の印の文言
+const FLOWER_PENDING_TEXT = '次の離陸で加速！', PENDING_AURA = { outer: '#ff6b8b', inner: '#ffd0da' }, RESCUE_TEXT = '立て直し';
+const RESCUE_GONE_MS = 600;   // r56：救済のアイコンが消える演出の長さ（CSS の rescueGone と同じ）
 function drawHibiscus(c, kind, x, y, r, rot) {
   const im = art(kind === 'white' ? FLOWER_ART.white : FLOWER_ART.red);
   if (!im) return false;
@@ -3611,6 +3837,10 @@ const fx = { flight: null, pred: null, parts: [], pops: [], ripples: [], confett
   glideRefills: 0,   // r40（テスト観測用）：キオビの応援で水切り復帰時に滑空が回復した回数
   streakFrames: 0,   // r47（テスト観測用）：速度筋を描いたフレーム数
   vbusy: { fever: false, combo: 0, speed: 0 },   // r47：声の多忙判定の入力（judge のコンボ・FEVER、fever イベント、直近の離陸速度）
+  // r55（テスト観測用）：rescuePops＝救済の床の印を出した回数、auraDraw＝保留中の赤花のオーラの描画記録
+  rescuePops: 0, auraDraw: null,
+  // r56：救済の消費の合図。n＝消費の合図を出した回数（テスト観測用・累計）、t＝最後に消費した時刻、left＝その消費の後の残数（HUD の消える1個の位置）
+  rescueUsed: { n: 0, t: -1e9, left: null },
 
   // r38：cutinLastT＝直前にカットインを設定した時刻、goodCutinDone／perfectCutinDone＝この走の初回 GOOD／PERFECT のカットインを出したか、
   // safeTaught＝この走で安全葉の説明を出したか、
@@ -3672,6 +3902,7 @@ eng.on('ready', rp => {
   fx.bigPop = null; fx.launchT = -1e9; fx.sinkT = null; fx.curLeaf = null; fx.flash = 0; fx.pulse = 0;
   fx.flight = null; fx.pred = null; fx.trail = null; fx.emph.clear(); leafImg.clear();
   fx.lock.id = null; fx.lock.k = 0; fx.aimDraw = null; fx.leafHitSafe.clear();
+  fx.rescueUsed.t = -1e9; fx.rescueUsed.left = null;   // r56：前の走の消える演出を持ち越さない
   fx.tkT = -1e9; fx.frogAxis = 0; fx.leafHitSide.clear(); fx.glideCheer = false; cutin = null; fx.cutinCount = 0;
   fx.cutinLastT = -1e9; fx.goodCutinDone = false; fx.perfectCutinDone = false; fx.safeTaught = false;
   fx.fev.parts.length = 0; fx.fev.lands.length = 0; fx.feverFlashT = -Infinity;
@@ -3699,11 +3930,14 @@ eng.on('takeoff', p => {
   }
   // r40：キオビ（ゆず）の応援発動＝水切り復帰で滑空残量が回復した瞬間（エンジンは回復したときだけ glideRefillMs を載せる）
   if (!p.fromLeaf && p.glideRefillMs > 0 && eng.getParams().glideOnSkip) { fx.glideRefills++; announce('cheer'); }
+  // r55 問題2：水切り復帰の離陸（発射＝seq 1 以外の葉でない離陸）は目標の取り直し
+  if (!p.fromLeaf && p.seq > 1) camRetarget();
+  camM.leafKey = null;
 });
 let firstDiveHint = true;
 let firstBonusHint = true;
 // r46：ダイブ入力の即時反応（縦伸びの起点 fx.diveT とバイブ 10ms）。風切り音は既存の SFX.dive のノイズスイープ
-eng.on('dive', p => { fx.diveT = nowMs(); vib(10); if (firstDiveHint) { bigPop('タップでダイブ！', '▼の葉に落ちるよ。着地でもう一度タップ'); firstDiveHint = false; } SFX.dive(); addParts(8, p.x, p.y, { a0: Math.PI * .35, spread: Math.PI * .5, speed: 120, life: .4, size: 3, col: 'rgba(220,240,255,.8)', g: 0 }); });
+eng.on('dive', p => { camRetarget(); fx.diveT = nowMs(); vib(10); if (firstDiveHint) { bigPop('タップでダイブ！', '▼の葉に落ちるよ。着地でもう一度タップ'); firstDiveHint = false; } SFX.dive(); addParts(8, p.x, p.y, { a0: Math.PI * .35, spread: Math.PI * .5, speed: 120, life: .4, size: 3, col: 'rgba(220,240,255,.8)', g: 0 }); });
 eng.on('state', ({ from, to }) => {
   if (to !== 'CHARGING') stopCharge();
   if (to === 'PAUSED') show('ovPause');
@@ -3738,6 +3972,9 @@ eng.on('judge', p => {
   // v3.1：ランプ後の実速度（speedOutAct）で予測する
   if (p.speedOut > 0) fx.pred = predictFlight(p.x, p.kind === 'leaf' ? C.leafY : 0, p.speedOutAct != null ? p.speedOutAct : p.speedOut, p.angleOutDeg);
   camM.dir = 0; camM.phase = 0; camM.ink = 0; camM.etaDesc = null; // 次の飛行の目標が決まったので、ズーム方向の固定と寄りの局面を解く
+  camM.rtLs = null; camM.leafKey = null;   // r55：取り直しの起点は飛行ごと（次の飛行では使わない）
+  // r56：救済を1回消費した着地は、専用の音と HUD のアイコンの消える演出で「今使った」を知らせる（安全葉の MIRACLE＝通常の跳ね方でも同じ）
+  if (p.rescueUsed) { fx.rescueUsed.n++; fx.rescueUsed.t = t; fx.rescueUsed.left = p.rescueLeft; SFX.rescueUsed(); }
   if (p.kind === 'leaf' && p.safe) {
     // r3.2：安全葉。判定の文字は出すが、コンボ表示・画面パルス・PERFECT の華やかな音は出さない（鈍い着地音）
     if (p.grade === 'PERFECT') { addPop('PERFECT', p.x, C.leafY + 70, 'perfectSafe'); addParts(8, p.x, C.leafY + 8, { speed: 200, life: .45, size: 3, col: '#dfe9f2', g: 400 }); vib(12); }
@@ -3749,6 +3986,8 @@ eng.on('judge', p => {
       popBelow('安全葉は小さく跳ねる', p.x, yJ, p.grade === 'GOOD' ? 54 : 32, 'safeNote');
     }
     SFX.safeLand(p.grade);
+    // r55 問題1：救済の床が付いた着地だけ、判定の下に小さく「立て直し」と短い上昇音（既存のポップと音の範囲で最小限）
+    if (p.rescueFloor > 0) { fx.rescuePops++; popBelow(RESCUE_TEXT, p.x, C.leafY + (p.grade === 'GOOD' ? 60 : 70), p.grade === 'GOOD' ? 54 : 32, 'safeNote'); SFX.rescue(); }
     if (p.nearMiss) { addPop('ギリギリ！', p.x, C.leafY + 8, 'near'); SFX.near(); }
   } else if (p.kind === 'leaf') {
     // r46：着地の二拍の1拍目「パシッ」（コンボ段のペンタトニック、金葉は倍音）。既存の判定音はその上に重ねたまま残す
@@ -3847,7 +4086,8 @@ eng.on('diveFizzle', () => tone(140, .05, { vol: .035, type: 'triangle' }));
 eng.on('brake', p => { SFX.brake(); addParts(6, p.x, p.y + 10, { speed: 80, life: .5, size: 5, col: 'rgba(255,255,255,.7)', g: -40 }); });
 eng.on('glide', p => { if (p.active) SFX.glide(); });
 eng.on('flowerGet', p => {
-  SFX.flower(); addPop(p.kind === 'white' ? '水切り +1' : 'FLOWER ×1.3', p.x, p.y + 30, 'flower'); addParts(20, p.x, p.y, { speed: 300, life: .7, size: 4.5, col: '#ff6b8b', shape: 'star', g: 200 });
+  // r55 問題4：ダイブ中に取った赤は保留（倍率は固定でないので「×1.3」とは出さず、次の離陸で加速すると知らせる）
+  SFX.flower(); addPop(p.kind === 'white' ? '水切り +1' : p.pending ? FLOWER_PENDING_TEXT : 'FLOWER ×1.3', p.x, p.y + 30, 'flower'); addParts(20, p.x, p.y, { speed: 300, life: .7, size: 4.5, col: '#ff6b8b', shape: 'star', g: 200 });
   if (p.cheer && eng.view.frog.family === 'yadoku') announce('cheer');   // r37：ヤドクの応援発動（応援で上乗せされた分の花を取った瞬間）
 });
 eng.on('leavesDisabled', p => { const t = nowMs(); for (const id of p.ids) fx.disabled.set(id, t); });
@@ -4325,7 +4565,7 @@ const GRANK_CONFIG = {
   storageBucket: 'kaeru-jumper.firebasestorage.app',
 };
 // clientId・保留キューは save.stats.grank に置く（stats は未知項目を保持する。新しい localStorage キーは作らない）
-KaeruRank.init({ enabled: GRANK_ENABLED, config: GRANK_CONFIG, version: 'r54', store: {
+KaeruRank.init({ enabled: GRANK_ENABLED, config: GRANK_CONFIG, version: 'r56', store: {
   read: () => (save.stats.grank && typeof save.stats.grank === 'object' && !Array.isArray(save.stats.grank) ? save.stats.grank : null),
   write: obj => { save.stats.grank = obj; writeSave(); },
 } });
@@ -4661,7 +4901,17 @@ const CAM = { xRate: 6.0, zRate: 3.2, margin: 60, frogMargin: 80 };
 const smooth01 = u => { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); };
 function mkTrack(v) { return { v, vel: 0, tv: 0, prevT: v }; }
 const camT = { y: mkTrack(0) };
-const camM = { x: 50, ls: 0, dir: 0, phase: 0, ink: 0, etaDesc: null, aimFloor: null, belowFloor: false };   // phase 0＝引き、1＝寄り。ink＝寄りの補間量 0〜1。etaDesc＝下降開始時の接触までの残り ms
+const camM = { x: 50, ls: 0, dir: 0, phase: 0, ink: 0, etaDesc: null, aimFloor: null, belowFloor: false,   // phase 0＝引き、1＝寄り。ink＝寄りの補間量 0〜1。etaDesc＝下降開始時の接触までの残り ms
+  afW: 0, afS: null, rtLs: null, leafKey: null, retargets: 0 };
+// r55 問題2（ズーム崩れの第1段）：
+//   ・aimFloor は倍率へ直接代入しない。重み afW（0〜1）を AIM_FLOOR_FADE_MS で上げ下げし、log 空間で afS（最後の aimFloor）へ寄せる。phase は書き換えない。
+//   ・目標の取り直し（ダイブ発動・保証葉の移動・水切り復帰）：引き側の補間の起点を「その時点の実表示倍率」rtLs にし、ink は 0 から、etaDesc は取り直す。
+//   ・最終表示（画面内保証の後）の倍率変化も 1 フレームあたり ±ZOOM.maxPerSec×dt に収める（速度上限を迂回する経路を残さない）。
+//   第2段（目標を1か所で計算＋単一フィルタ化）は未実施（R55_NOTES.md 残件）
+const AIM_FLOOR_FADE_MS = 300;
+function camRetarget() {
+  camM.rtLs = camM.ls; camM.ink = 0; camM.phase = 0; camM.etaDesc = null; camM.retargets++;
+}
 let camTarget = null;
 function track(o, target, dt, w, maxV) {
   if (dt <= 0) return;
@@ -4676,6 +4926,7 @@ function track(o, target, dt, w, maxV) {
 }
 function snapCamera(x, s) {
   camM.x = x; camM.ls = Math.log(s); camM.dir = 0; camM.phase = 0; camM.ink = 0; camM.etaDesc = null; camT.y = mkTrack(0); camTarget = null;
+  camM.afW = 0; camM.afS = null; camM.rtLs = null; camM.leafKey = null; camM.aimFloor = null; camM.belowFloor = false;
   cam.x = x; cam.s = s; cam.yoff = 0;
 }
 // 速度 v・角 angleDeg（省略時 55°）で高さ y0 から飛んだときの到達点（葉の高さへの下降交点）と頂点
@@ -4716,6 +4967,14 @@ function updateCamera(v, dt) {
       const sCap = b * Math.exp(-ZOOM.pullCapRate * fl.descentMs / 1000);
       if (s < sCap) s = sCap;
     }
+    // r55 問題2：保証葉の移動（同じ飛行の中で対象葉の id／位置が変わった）は目標の取り直し
+    if (AIR[st]) {
+      const key = c.leaf ? c.leaf.id + ':' + c.leaf.x : 'none';
+      if (camM.leafKey != null && key !== camM.leafKey) camRetarget();
+      camM.leafKey = key;
+    }
+    // r55 問題2：取り直しの後は、引き側の起点を取り直した時点の実表示倍率にする（それより寄った目標にはしない。引く必要があれば引く）
+    if (camM.rtLs != null) s = Math.min(s, Math.exp(camM.rtLs));
     // v3.1：下降中、対象葉への接触が近づいたら寄る
     const nx = v.next;
     if (AIR[st] && c.leaf && f.vy < 0 && nx && nx.kind === 'leaf' && st !== 'BOUNCING') {
@@ -4734,14 +4993,20 @@ function updateCamera(v, dt) {
     }
     // r3.2 D：下降中は「ダイブで狙える範囲（とカエル・保証葉）が画面に入る倍率」を引きの下限にする。
     //   左端は離陸点ではなくカエルの現在位置。上昇中・チャージ中・ダイブ後（範囲なし）は従来どおり
+    //   r55 問題2：直接代入をやめ、重み afW のフェード（AIM_FLOOR_FADE_MS）でつなぐ。phase は書き換えない
     camM.aimFloor = null; camM.belowFloor = false;
     const ar = v.aimRange;
     if (AIR[st] && st !== 'BOUNCING' && f.vy < 0 && ar && c.leaf) {
       const Lx = Math.min(f.x, ar.x0, c.leaf.x - c.leaf.w / 2), R = Math.max(ar.x1, c.leaf.x + c.leaf.w / 2);
       const sf = Math.min(b * ZOOM.closeMax, W / (Math.max(ZOOM.closeSpan, R - Lx + 140) * 1.06), Math.max(.16, (wy - 90) / Math.max(1, f.y + 70)));
-      camM.aimFloor = sf;
-      if (sf > s) { s = sf; camM.phase = 1; }
-      camM.belowFloor = camM.ls < Math.log(sf) - 1e-6;
+      camM.aimFloor = sf; camM.afS = sf;
+    }
+    if (dt > 0) camM.afW = clamp(camM.afW + (camM.aimFloor != null ? 1 : -1) * dt * 1000 / AIM_FLOOR_FADE_MS, 0, 1);
+    if (camM.afW <= 0) camM.afS = null;
+    if (camM.afW > 0 && camM.afS != null && camM.afS > s) {
+      const sfEff = Math.exp(Math.log(s) + (Math.log(camM.afS) - Math.log(s)) * smooth01(camM.afW));
+      s = sfEff;
+      camM.belowFloor = camM.ls < Math.log(sfEff) - 1e-6;
     }
     const half = W / 2 / s;
     let x = f.x + half * .3;                      // カエルは画面の左寄り
@@ -4753,12 +5018,13 @@ function updateCamera(v, dt) {
   camTarget = tg;
   if (pre) { camM.x = tg.x; camM.ls = Math.log(tg.s); camM.dir = 0; }
   else if (dt > 0) {
+    const ls0 = camM.ls;   // r55 問題2：このフレームの開始時の実表示倍率（最終表示の変化速度の基準）
     // ズーム：指数接近（行き過ぎない）＋1回の飛行の中では向きを固定
     const fl = camM.belowFloor;   // r3.2 D：引きの下限を下回っている間は速めに寄る（上限は全体の maxPerSec の範囲内）
     let dl = (Math.log(tg.s) - camM.ls) * (1 - Math.exp(-(fl ? ZOOM.zRateFloor : camM.phase === 1 ? ZOOM.zRateIn : CAM.zRate) * dt));
     dl = clamp(dl, -ZOOM.maxPerSec * dt, ZOOM.maxPerSec * dt);   // v3.1：スナップ防止の速度上限
     if (camM.phase === 1) { dl = clamp(dl, 0, (fl ? ZOOM.floorInPerSec : ZOOM.maxInPerSec) * dt); camM.dir = 1; }   // v3.1：寄りの局面は寄る一方（安全のための引きだけ下で許す）
-    else if (camM.dir !== 0 && Math.sign(dl) === -camM.dir) dl = 0;
+    else if (camM.dir !== 0 && Math.sign(dl) === -camM.dir && !(fl && dl > 0 && f.vy < 0 && AIR[st])) dl = 0;   // r55：aimFloor の寄せ（下降中）だけは引き→寄りへの反転を許す（phase は変えない）
     else if (Math.abs(dl) > 1e-4) camM.dir = Math.sign(dl);
     camM.ls += dl;
     // 横位置：指数接近＋単調非減少
@@ -4782,6 +5048,18 @@ function updateCamera(v, dt) {
     if (camM.x - f.x > 0) s = Math.min(s, hm / (camM.x - f.x));      // カエルが左へ抜けない（横位置を戻さずズームアウトで）
     // 安全側に引いたら、この飛行の向きは「引き」に固定する（引いた直後に寄り戻すと後戻りに見えるため）
     if (Math.log(s) < camM.ls - 1e-6 && camM.phase === 0) camM.dir = -1;
+    // r55 問題2：画面内保証による引きも、最終表示の変化速度の上限（±maxPerSec×dt）を超えない。
+    //   上限で引ききれない分は横位置（前進の向きだけ）で補い、カエルを優先して画面に残す（保証葉の右端は数フレーム遅れて入ることがある）
+    //   r55 継続3：上の横位置の補正は上限で切る前の（小さい）倍率で計算されているので、切った後の倍率で横位置を取り直す。
+    //   前フレームの位置（previousX）より後ろには戻さない（前進の向きだけ）。カエルの左端の余白 hm/s を超えて先へ出ていた分だけ引き戻す。
+    //   カエルが後ろへ進まない限り、前フレームでカエルが画面内なら previousX ≤ f.x + hm/s が成り立つので、カエルは必ず画面内に残る（R55_NOTES.md）
+    const lsMin = ls0 - ZOOM.maxPerSec * dt, lsMax = ls0 + ZOOM.maxPerSec * dt;
+    if (Math.log(s) < lsMin) {
+      s = Math.exp(lsMin);
+      camM.x = Math.max(previousX, Math.min(camM.x, f.x + hm / s));
+      if (c.leaf) camM.x = Math.max(camM.x, Math.min(c.leaf.x + c.leaf.w / 2 - hm / s, f.x + hm / s));
+      camM.x = Math.max(camM.x, f.x - (W / 2 - CAM.frogMargin) / s);
+    } else if (Math.log(s) > lsMax) s = Math.exp(lsMax);
     camM.ls = Math.log(s);
   }
   const s = Math.exp(camM.ls);
@@ -5575,6 +5853,16 @@ function render(v, t) {
       ctx.translate(0, Math.min(dy, u * 3.2));
     }
     const vk = clamp(.62 / s, 1, 2.4); ctx.scale(vk, vk); // 引きの画面でもカエルが見えるよう見た目だけ拡大
+    // r55 問題4：ダイブ中に取った赤花の加速を保留している間は、カエルの後ろに赤い発光（オーラ）を出す（次の離陸で消える）
+    fx.auraDraw = null;
+    if (v.hud.pendingBoost > 0 && st !== 'SINKING' && st !== 'GAME_OVER') {
+      const u = 13 * f.scale, pulse = .8 + .2 * Math.sin(t / 110);
+      ctx.save();
+      ctx.globalAlpha = .28 * pulse; ctx.fillStyle = PENDING_AURA.outer; ell(ctx, 0, -u * .7, u * 2.4, u * 1.9); ctx.fill();
+      ctx.globalAlpha = .4 * pulse; ctx.fillStyle = PENDING_AURA.inner; ell(ctx, 0, -u * .7, u * 1.6, u * 1.25); ctx.fill();
+      ctx.restore();
+      fx.auraDraw = { boost: v.hud.pendingBoost, state: st };
+    }
     // r37：画像のカエル。描けなければ従来の図形描き
     const so = frogSpriteOpts(v, f, t, rot, leafOffRaw);
     if (!so || !drawFrogSprite(ctx, f.family, so.sp, so)) drawFrog(ctx, f.id, f.pose, t, { rot, shake: st === 'CHARGING' ? v.hud.charge * 2.2 : 0 });
@@ -5700,6 +5988,14 @@ function updateHUD(v) {
   $('bPause').textContent = st === 'PAUSED' ? '▶' : '⏸';
   // r38 C2：水切りの残数は距離の右に「💧×N」（0 のときも出す）
   setH('hDist', `${f1(h.distance)}<small>m</small><span class="skips">💧×${h.skipsLeft || 0}</span>`);
+  // r56：救済の残数。プレイ中は常に総量ぶんの 🍃 を並べ、使った分は淡色。消費から 600ms はその1個を消える演出で描く（数字にはしない）
+  {
+    const stock = h.rescueStock || 0, left = clamp(h.rescueLeft || 0, 0, stock), RU = fx.rescueUsed;
+    const gone = RU.left === left && nowMs() - RU.t < RESCUE_GONE_MS ? left : -1;
+    let html = '';
+    for (let i = 0; i < stock; i++) html += `<span class="ri${i === gone ? ' gone' : i >= left ? ' off' : ''}">🍃</span>`;
+    setH('hRescue', html);
+  }
   // r38 C1：ベストの残り50m 以内（エンジンの bestRemaining）は「ベストまで あと ◯m」
   setH('hBest', h.bestRemaining != null ? `<span class="near">ベストまで あと ${c1(h.bestRemaining)}m</span>` : `ベスト ${f1(h.best)}m`);
   setH('hAir', h.airOver ? `BIG AIR ${f1(h.airLive)}m 更新中！` : '');   // r37：ベストを超えた飛行の間だけ（常時の行は足さない）
@@ -5726,7 +6022,7 @@ function frame() {
   const before = eng.view.hud.distance;
   bestLineThisFrame = false;
   const v = eng.update(t);
-  updateBgm(v); stepBgmFade();
+  updateBgm(v); stepBgmFade(); bgmWatch(t);   // r55：照合の定期チェック（バックオフつき）
   if (!bestLineThisFrame) {
     const crossed = extraMilestones.find(m => before < m && m <= v.hud.distance);
     if (crossed != null) showMilestone(crossed);
@@ -5773,6 +6069,9 @@ window.__kaeru = { eng, save, cam, debug: { STAGE_BOUNDS, STAGES, stageAt, stage
   FEVER_PARTICLE_MAX, fevSprites,   // r44：FEVER 演出の粒子上限・スプライトの観測用（テスト専用）
   // r3.2：照準・ロックオン・安全葉の見た目の観測用（テスト専用。挙動には影響しない）
   SAFE_LOOK, AIM_MARK, leafPalette, rideBandStyle, leafOffset, leafKey, aimDraw: () => fx.aimDraw, lock: () => fx.lock, leafImg,
+  // r55：ズーム第1段（取り直し・aimFloor のフェード）の観測用（テスト専用）。r56：滑空マーカーは削除
+  updateCamera, camRetarget, ZOOM, AIM_FLOOR_FADE_MS, lastProj: () => lastProj,
+  RESCUE_GONE_MS,   // r56：救済の消える演出の長さ（テスト専用）
   // r37：素材・カットイン・BIG AIR の観測用（テスト専用。挙動には影響しない）
   ART, ASSET_NAMES, spritePose, frogSprite, frogSpriteOpts, leafArt, cutin: () => cutin, showCutin, GIRL, LINES, cutinArt, buildCards, showResult,
   // r38：相棒名・カットインのバリエーション・次に狙うこと・見出しの観測用（テスト専用）
@@ -5790,7 +6089,10 @@ window.__kaeru = { eng, save, cam, debug: { STAGE_BOUNDS, STAGES, stageAt, stage
   voiceRate: () => media ? media.voice.playbackRate : null, speedCap: K.speedCap,
   CAM_SPEED, camSpeedFactor, STREAK, speedStreakK, speedStreaks,
   // r44：結果画面の相棒の全身（るりの出迎え welcome）の観測用（テスト専用）
-  drawResultGirl, resultInfo: () => resultInfo } };   // v3.1：カメラ・強調の観測用（テスト専用。挙動には影響しない）
+  drawResultGirl, resultInfo: () => resultInfo,
+  // r55：BGM の堅牢化（世代つきフェード・照合・FEVER 中の pause・診断ログ）の観測用（テスト専用）
+  bgm: { media: () => media, syncBgm, stepBgmFade, finishBgmFade, reconcile: bgmReconcile, watch: bgmWatch, kick: bgmKick, desired: bgmDesired,
+    log: BGM_LOG, LOG_MAX: BGM_LOG_MAX, setFever: on => { bgmFeverOn = !!on; }, track: () => bgmTrack, updateBgm } } };   // v3.1：カメラ・強調の観測用（テスト専用。挙動には影響しない）
 })();
 </script>
 
